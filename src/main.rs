@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -21,19 +21,20 @@ use tokio::sync::Notify;
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-const NUM_TOPICS: usize = 8;
+const NUM_TOPICS: usize = 20;
+const NUM_MSGS: usize = 100;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     let admin = Arc::new(create_admin());
 
-    let topics: Vec<String> = { 1..NUM_TOPICS+1 }
+    let topics: Vec<String> = { 1..NUM_TOPICS + 1 }
         .into_iter()
         .map(|i| format!("topic{}", i))
         .collect();
 
     for topic in &topics {
-        println!("adding topic {}", topic);
+        //println!("adding topic {}", topic);
         let topic = [&NewTopic::new(
             topic.as_str(),
             1,
@@ -53,9 +54,7 @@ async fn main() {
         let count = Arc::new(AtomicUsize::new(0));
 
         for topic in &topics {
-            let tripwire = tripwire.clone();
             let topic = topic.clone();
-            let admin = admin.clone();
             let notify = notify.clone();
             let count = count.clone();
             let task = spawn(async move {
@@ -66,9 +65,7 @@ async fn main() {
                     .create()
                     .expect("producer creation error");
 
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-
-                let futures = (0..1000)
+                let futures = (0..NUM_MSGS)
                     .map(|i| async move {
                         // The send operation on the topic returns a future, which will be
                         // completed once the result or failure from Kafka is received.
@@ -87,16 +84,11 @@ async fn main() {
 
                 loop {
                     tokio::select! {
-                      _ = tripwire.clone() => {
-                        println!("all done");
-                        break;
-                      },
                       _ = join_all(futures) => {
-                        let topic = &[topic.as_str()];
+                        //let topic = &[topic.as_str()];
                         count.fetch_add(1, Ordering::SeqCst);
                         notify.notify_one();
                         //println!("submitted messages");
-                        admin.delete_topics(topic, &AdminOptions::new()).await.expect("couldn't delete topic");
                         break;
                       },
                     }
@@ -113,18 +105,23 @@ async fn main() {
                 let consumer = create_consumer(client_id, std::slice::from_ref(&topic.as_str()))
                     .expect("consumer creation failure");
                 let mut stream = consumer.stream();
+                let mut msg_count = 0;
+                let mut err_count = 0;
 
                 loop {
                     tokio::select! {
                       _ = tripwire.clone() => {
-                        println!("all done {}", topic);
+                        println!("all done {} messages = {}, errors = {}", topic, msg_count, err_count);
                         break;
                       },
                       message = stream.next() => match message {
-                          None => break,  // WHY?
-                          Some(Err(error)) => println!("got error: {:?}", error),
+                          None => {panic!("shouldn't happen!"); },  // WHY?
+                          //Some(Err(error)) => println!("got error: {:?}", error),
+                          Some(Err(_error)) => { err_count += 1; },
                           Some(Ok(_msg)) => {
-                              //println!("got message: {:?}", msg);
+                              msg_count += 1;
+                              tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+                              //println!("got message: {:?}", _msg);
                           }
                       },
                     }
@@ -138,11 +135,22 @@ async fn main() {
             //println!("notified {}", count.load(Ordering::SeqCst));
         }
 
+        // Give time for consumers to get messages
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+        for topic in &topics {
+            admin
+                .delete_topics(&[topic], &AdminOptions::new())
+                .await
+                .expect("couldn't delete topic");
+        }
+
         drop(trigger);
 
         //println!("joining");
-        let _ = join_all(futures);
-        println!("complete {}", chrono::offset::Local::now());
+        let len = futures.len();
+        let _ = join_all(futures).await;
+        println!("complete {} {}", chrono::offset::Local::now(), len);
     }
 }
 

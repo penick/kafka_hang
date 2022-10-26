@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -15,17 +16,18 @@ use snafu::ResultExt;
 use snafu::Snafu;
 use stream_cancel::Tripwire;
 use tokio::spawn;
+use tokio::sync::Notify;
 
 pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 
-const NUM_TOPICS: i32 = 8;
+const NUM_TOPICS: usize = 8;
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     let admin = Arc::new(create_admin());
 
-    let topics: Vec<String> = { 1..NUM_TOPICS }
+    let topics: Vec<String> = { 1..NUM_TOPICS+1 }
         .into_iter()
         .map(|i| format!("topic{}", i))
         .collect();
@@ -43,14 +45,19 @@ async fn main() {
             .expect("admin creation failure");
     }
 
-    for _ in 0..100 {
+    for _ in 0..999999999 {
         let mut futures = vec![];
         let (trigger, tripwire) = Tripwire::new();
+
+        let notify = Arc::new(Notify::new());
+        let count = Arc::new(AtomicUsize::new(0));
 
         for topic in &topics {
             let tripwire = tripwire.clone();
             let topic = topic.clone();
             let admin = admin.clone();
+            let notify = notify.clone();
+            let count = count.clone();
             let task = spawn(async move {
                 let topic = &topic;
                 let producer: &FutureProducer = &ClientConfig::new()
@@ -86,7 +93,9 @@ async fn main() {
                       },
                       _ = join_all(futures) => {
                         let topic = &[topic.as_str()];
-                        println!("submitted messages");
+                        count.fetch_add(1, Ordering::SeqCst);
+                        notify.notify_one();
+                        //println!("submitted messages");
                         admin.delete_topics(topic, &AdminOptions::new()).await.expect("couldn't delete topic");
                         break;
                       },
@@ -108,14 +117,14 @@ async fn main() {
                 loop {
                     tokio::select! {
                       _ = tripwire.clone() => {
-                        println!("all done");
+                        println!("all done {}", topic);
                         break;
                       },
                       message = stream.next() => match message {
                           None => break,  // WHY?
                           Some(Err(error)) => println!("got error: {:?}", error),
-                          Some(Ok(msg)) => {
-                              println!("got message: {:?}", msg);
+                          Some(Ok(_msg)) => {
+                              //println!("got message: {:?}", msg);
                           }
                       },
                     }
@@ -124,13 +133,16 @@ async fn main() {
             futures.push(task);
         }
 
-        tokio::time::sleep(tokio::time::Duration::from_secs(1000)).await;
+        while count.load(Ordering::SeqCst) != NUM_TOPICS {
+            notify.notified().await;
+            //println!("notified {}", count.load(Ordering::SeqCst));
+        }
 
         drop(trigger);
 
-        println!("joining");
+        //println!("joining");
         let _ = join_all(futures);
-        println!("joined");
+        println!("complete {}", chrono::offset::Local::now());
     }
 }
 

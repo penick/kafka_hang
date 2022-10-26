@@ -19,3 +19,4 @@ console-subscriber = { version = "0.1.7", default-features = false, optional = t
 snafu = { version = "0.7.3", features = ["futures"] }
 rdkafka = { version = "0.28.0", features = ["tokio", "libz", "ssl", "zstd"] }
 stream-cancel = "0.8.1"
+chrono = "0.4.22"

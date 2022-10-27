@@ -10,7 +10,7 @@ use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{
     consumer::{Consumer, ConsumerContext, StreamConsumer},
     ClientConfig, ClientContext, Statistics,
-    message::Message,
+    message::{Message, Header},
 };
 use snafu::ResultExt;
 use snafu::Snafu;
@@ -67,9 +67,9 @@ async fn main() {
                     let delivery_status = producer
                         .send(
                             FutureRecord::to(topic)
-                            .payload(&format!("Message {}", i))
+                            .payload(&format!("Message {} {{ 'hello': 'mezmo from vector' }}", i))
                             .key(&format!("Key {}", i))
-                            .headers(OwnedHeaders::new().add("k1", "v1")),
+                            .headers(OwnedHeaders::new().insert(Header { key: "k1", value: Some("v1") })),
                             Duration::from_secs(0),
                             )
                         .await;
@@ -83,44 +83,10 @@ async fn main() {
 
 
         for topic in &topics {
-            let tripwire = tripwire.clone();
-            let topic = topic.clone();
-            let bootstrap_servers = bootstrap_servers.clone();
-            let task = spawn(async move {
-                let client_id = &topic;
-                let consumer = create_consumer(
-                    &bootstrap_servers, 
-                    client_id, 
-                    std::slice::from_ref(&topic.as_str())
-                )
-                    .expect("consumer creation failure");
-                let mut stream = consumer.stream();
-                let mut msg_count = 0;
-                let mut err_count = 0;
-                let mut err_store_offset_count = 0;
-
-                loop {
-                    tokio::select! {
-                      _ = tripwire.clone() => {
-                        println!("all done {} messages = {}, errors = {}, errors store offset = {}", topic, msg_count, err_count, err_store_offset_count);
-                        break;
-                      },
-                      message = stream.next() => match message {
-                          None => {panic!("shouldn't happen!"); },  // WHY?
-                          Some(Err(_error)) => { err_count += 1; println!("got error: {:?}", _error) },
-                          Some(Ok(msg)) => {
-                              msg_count += 1;
-                              tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-                              if let Err(_err)  = consumer.store_offset(msg.topic(), msg.partition(), msg.offset()) {
-                                  err_store_offset_count += 1;
-                              }
-                              //println!("got message: {:?}", _msg);
-                          }
-                      },
-                    }
-                }
-            });
-            futures.push(task);
+            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
+            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
+            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
+            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
         }
 
 
@@ -163,6 +129,50 @@ impl ClientContext for KafkaStatisticsContext {
 }
 
 impl ConsumerContext for KafkaStatisticsContext {}
+
+fn create_consumer_task(
+    bootstrap_servers: &str,
+    topic: &str,
+    tripwire: Tripwire,
+    ) -> tokio::task::JoinHandle<()> {
+    let topic = topic.to_string();
+    let bootstrap_servers = bootstrap_servers.to_string();
+    spawn(async move {
+        let client_id = &topic;
+        let consumer = create_consumer(
+            &bootstrap_servers, 
+            client_id, 
+            std::slice::from_ref(&topic.as_str())
+            )
+            .expect("consumer creation failure");
+        let mut stream = consumer.stream();
+        let mut msg_count = 0;
+        let mut err_count = 0;
+        let mut err_store_offset_count = 0;
+
+        loop {
+            tokio::select! {
+                _ = tripwire.clone() => {
+                    println!("all done {} messages = {}, errors = {}, errors store offset = {}", topic, msg_count, err_count, err_store_offset_count);
+                    break;
+                },
+                message = stream.next() => match message {
+                    None => {panic!("shouldn't happen!"); },  // WHY?
+                    Some(Err(_error)) => { err_count += 1; println!("got error: {:?}", _error) },
+                    Some(Ok(msg)) => {
+                        msg_count += 1;
+                        let _result = msg.payload();
+                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        if let Err(_err)  = consumer.store_offset(msg.topic(), msg.partition(), msg.offset()) {
+                            err_store_offset_count += 1;
+                        }
+                        //println!("got message: {:?}", _msg);
+                    }
+                },
+            }
+        }
+    })
+}
 
 fn create_consumer(
     bootstrap_servers: &str,

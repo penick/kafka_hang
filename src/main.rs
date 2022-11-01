@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize};
 use std::time::Duration;
 
 use futures::future::join_all;
@@ -82,11 +83,10 @@ async fn main() {
         }
 
 
+        let counter = Arc::new(AtomicUsize::new(topics.len() * 4));
+
         for topic in &topics {
-            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
-            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
-            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
-            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone()));
+            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone(), counter.clone()));
         }
 
 
@@ -128,12 +128,17 @@ impl ClientContext for KafkaStatisticsContext {
     }
 }
 
-impl ConsumerContext for KafkaStatisticsContext {}
+impl ConsumerContext for KafkaStatisticsContext {
+    fn pre_rebalance<'a>(&self, _rebalance: &rdkafka::consumer::Rebalance<'a>) {
+        println!("rebalance");
+    }
+}
 
 fn create_consumer_task(
     bootstrap_servers: &str,
     topic: &str,
     tripwire: Tripwire,
+    counter: Arc<AtomicUsize> ,
     ) -> tokio::task::JoinHandle<()> {
     let topic = topic.to_string();
     let bootstrap_servers = bootstrap_servers.to_string();
@@ -153,7 +158,9 @@ fn create_consumer_task(
         loop {
             tokio::select! {
                 _ = tripwire.clone() => {
-                    println!("all done {} messages = {}, errors = {}, errors store offset = {}", topic, msg_count, err_count, err_store_offset_count);
+                    println!("all done {} messages = {}, errors = {}, errors store offset = {}, count = {}", 
+                        topic, msg_count, err_count, err_store_offset_count, 
+                        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1);
                     break;
                 },
                 message = stream.next() => match message {

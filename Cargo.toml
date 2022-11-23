@@ -17,6 +17,9 @@ tokio-stream = { version = "0.1.9", default-features = false, features = ["net",
 tokio-util = { version = "0.7", default-features = false, features = ["io", "time"] }
 console-subscriber = { version = "0.1.7", default-features = false, optional = true }
 snafu = { version = "0.7.3", features = ["futures"] }
-rdkafka = { version = "0.28.0", features = ["tokio", "libz", "ssl", "zstd"] }
+bitflags = { version = "1.3.2"}
+#rdkafka = { version = "0.28.0", features = ["tokio", "libz", "ssl", "zstd"] }
+#rdkafka = { git = "https://github.com/answerbook/rust-rdkafka", branch = "fix-drop-order", features = ["tokio", "libz", "ssl", "zstd"] }
+rdkafka = { git = "https://github.com/fede1024/rust-rdkafka.git", tag = "v0.29.0", features = ["tokio", "libz", "ssl", "zstd"]}
 stream-cancel = "0.8.1"
 chrono = "0.4.22"

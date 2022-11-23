@@ -1,7 +1,8 @@
+use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize};
 use std::time::Duration;
 
+use bitflags::bitflags;
 use futures::future::join_all;
 use futures::StreamExt;
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
@@ -10,8 +11,8 @@ use rdkafka::message::OwnedHeaders;
 use rdkafka::producer::{FutureProducer, FutureRecord};
 use rdkafka::{
     consumer::{Consumer, ConsumerContext, StreamConsumer},
+    message::{Header, Message},
     ClientConfig, ClientContext, Statistics,
-    message::{Message, Header},
 };
 use snafu::ResultExt;
 use snafu::Snafu;
@@ -24,9 +25,34 @@ pub type Result<T> = std::result::Result<T, Error>;
 const NUM_TOPICS: usize = 100;
 const NUM_MSGS: usize = 200;
 
+bitflags! {
+    pub struct Flags : u32{
+        const NONE = 0x0;
+        const CREATE = 0x1;
+        const PRODUCE = 0x2;
+        const DROP = 0x4;
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
     let bootstrap_servers = std::env::args().nth(1).expect("no bootstraps servers given");
+    let flag_arg = std::env::args().nth(2);
+    let flags = match flag_arg {
+        Some(ref flags) => flags
+            .split(",")
+            .map(|value| match value.to_lowercase().as_str() {
+                "create" => Flags::CREATE,
+                "produce" => Flags::PRODUCE,
+                "drop" => Flags::DROP,
+                &_ => Flags::NONE,
+            })
+            .reduce(|flags: Flags, flag| flags | flag)
+            .unwrap(),
+        None => Flags::CREATE,
+    };
+
+    println!("Using the following flags: {:?}", flags);
 
     let admin = Arc::new(create_admin(&bootstrap_servers));
 
@@ -35,70 +61,56 @@ async fn main() {
         .map(|i| format!("test.rdkafka.{}", i))
         .collect();
 
+    if flags.contains(Flags::CREATE) {
+        create_topics(admin.clone(), &topics).await;
+    }
+
     for _ in 0..999999999 {
-        for topic in &topics {
-            //println!("adding topic {}", topic);
-            let topic = [&NewTopic::new(
-                topic.as_str(),
-                1,
-                TopicReplication::Fixed(-1),
-                )];
-            admin
-                .create_topics(topic, &AdminOptions::new())
-                .await
-                .expect("admin creation failure");
-        }
-
-        println!("created topics");
-
         let mut futures = vec![];
         let (trigger, tripwire) = Tripwire::new();
 
-        for topic in &topics {
-            let producer: &FutureProducer = &ClientConfig::new()
-                .set("bootstrap.servers", &bootstrap_servers)
-                .set("message.timeout.ms", "5000")
-                .create()
-                .expect("producer creation error");
-
-            let producer_futures = (0..NUM_MSGS)
-                .map(|i| async move {
-                    // The send operation on the topic returns a future, which will be
-                    // completed once the result or failure from Kafka is received.
-                    let delivery_status = producer
-                        .send(
-                            FutureRecord::to(topic)
-                            .payload(&format!("Message {} {{ 'hello': 'mezmo from vector' }}", i))
-                            .key(&format!("Key {}", i))
-                            .headers(OwnedHeaders::new().insert(Header { key: "k1", value: Some("v1") })),
-                            Duration::from_secs(0),
-                            )
-                        .await;
-                    delivery_status
-                })
-            .collect::<Vec<_>>();
-
-            let _result = join_all(producer_futures).await;
-            //println!("wrote messages to topic {}: {:?}", topic, result);
-        }
-
-
         let counter = Arc::new(AtomicUsize::new(topics.len() * 4));
 
-        for topic in &topics {
-            futures.push(create_consumer_task(bootstrap_servers.as_str(), topic.as_str(), tripwire.clone(), counter.clone()));
+        if flags.contains(Flags::DROP) {
+            create_topics(admin.clone(), &topics).await;
         }
 
+        if flags.contains(Flags::PRODUCE) {
+            produce_messages(&topics, bootstrap_servers.as_str()).await;
+        }
+
+        for topic in &topics {
+            futures.push(create_consumer_task(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+                counter.clone(),
+            ));
+            futures.push(create_consumer_task(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+                counter.clone(),
+            ));
+            futures.push(create_consumer_task(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+                counter.clone(),
+            ));
+            futures.push(create_consumer_task(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+                counter.clone(),
+            ));
+        }
 
         // Give time for consumers to get messages
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
 
-        println!("drop topics");
-        for topic in &topics {
-            admin
-                .delete_topics(&[topic], &AdminOptions::new())
-                .await
-                .expect("couldn't delete topic");
+        if flags.contains(Flags::DROP) {
+            drop_topics(admin.clone(), &topics).await;
         }
 
         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -134,22 +146,81 @@ impl ConsumerContext for KafkaStatisticsContext {
     }
 }
 
+async fn produce_messages(topics: &Vec<String>, bootstrap_servers: &str) {
+    for topic in topics {
+        let producer: &FutureProducer = &ClientConfig::new()
+            .set("bootstrap.servers", bootstrap_servers)
+            .set("message.timeout.ms", "5000")
+            .create()
+            .expect("producer creation error");
+
+        let producer_futures = (0..NUM_MSGS)
+            .map(|i| async move {
+                // The send operation on the topic returns a future, which will be
+                // completed once the result or failure from Kafka is received.
+                let delivery_status = producer
+                    .send(
+                        FutureRecord::to(topic)
+                            .payload(&format!("Message {} {{ 'hello': 'mezmo from vector' }}", i))
+                            .key(&format!("Key {}", i))
+                            .headers(OwnedHeaders::new().insert(Header {
+                                key: "k1",
+                                value: Some("v1"),
+                            })),
+                        Duration::from_secs(0),
+                    )
+                    .await;
+                delivery_status
+            })
+            .collect::<Vec<_>>();
+
+        let _result = join_all(producer_futures).await;
+        //println!("wrote messages to topic {}: {:?}", topic, result);
+    }
+}
+
+async fn create_topics(admin: Arc<AdminClient<DefaultClientContext>>, topics: &Vec<String>) {
+    for topic in topics {
+        //println!("adding topic {}", topic);
+        let topic = [&NewTopic::new(
+            topic.as_str(),
+            1,
+            TopicReplication::Fixed(-1),
+        )];
+        admin
+            .create_topics(topic, &AdminOptions::new())
+            .await
+            .expect("admin creation failure");
+    }
+    println!("created topics");
+}
+
+async fn drop_topics(admin: Arc<AdminClient<DefaultClientContext>>, topics: &Vec<String>) {
+    println!("drop topics");
+    for topic in topics {
+        admin
+            .delete_topics(&[topic], &AdminOptions::new())
+            .await
+            .expect("couldn't delete topic");
+    }
+}
+
 fn create_consumer_task(
     bootstrap_servers: &str,
     topic: &str,
     tripwire: Tripwire,
-    counter: Arc<AtomicUsize> ,
-    ) -> tokio::task::JoinHandle<()> {
+    counter: Arc<AtomicUsize>,
+) -> tokio::task::JoinHandle<()> {
     let topic = topic.to_string();
     let bootstrap_servers = bootstrap_servers.to_string();
     spawn(async move {
         let client_id = &topic;
         let consumer = create_consumer(
-            &bootstrap_servers, 
-            client_id, 
-            std::slice::from_ref(&topic.as_str())
-            )
-            .expect("consumer creation failure");
+            &bootstrap_servers,
+            client_id,
+            std::slice::from_ref(&topic.as_str()),
+        )
+        .expect("consumer creation failure");
         let mut stream = consumer.stream();
         let mut msg_count = 0;
         let mut err_count = 0;
@@ -158,8 +229,8 @@ fn create_consumer_task(
         loop {
             tokio::select! {
                 _ = tripwire.clone() => {
-                    println!("all done {} messages = {}, errors = {}, errors store offset = {}, count = {}", 
-                        topic, msg_count, err_count, err_store_offset_count, 
+                    println!("all done {} messages = {}, errors = {}, errors store offset = {}, count = {}",
+                        topic, msg_count, err_count, err_store_offset_count,
                         counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1);
                     break;
                 },
@@ -209,9 +280,7 @@ fn create_consumer(
     Ok(consumer)
 }
 
-fn create_admin(
-    bootstrap_servers: &str,
-) -> AdminClient<DefaultClientContext> {
+fn create_admin(bootstrap_servers: &str) -> AdminClient<DefaultClientContext> {
     let mut config = ClientConfig::new();
     config.set("bootstrap.servers", bootstrap_servers);
     config.create().expect("admin client creation failed")

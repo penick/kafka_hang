@@ -1,10 +1,11 @@
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 use std::time::Duration;
+use std::vec;
 
 use bitflags::bitflags;
-use futures::future::join_all;
-use futures::StreamExt;
+use futures::future::{join_all, OptionFuture};
+use futures::{StreamExt};
 use rdkafka::admin::{AdminClient, AdminOptions, NewTopic, TopicReplication};
 use rdkafka::client::DefaultClientContext;
 use rdkafka::message::OwnedHeaders;
@@ -23,7 +24,7 @@ pub type Error = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub type Result<T> = std::result::Result<T, Error>;
 
 const NUM_TOPICS: usize = 100;
-const NUM_MSGS: usize = 200;
+const NUM_MSGS: usize = 20000;
 
 bitflags! {
     pub struct Flags : u32{
@@ -31,12 +32,15 @@ bitflags! {
         const CREATE = 0x1;
         const PRODUCE = 0x2;
         const DROP = 0x4;
+        const CONSUME = 0x8;
     }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 8)]
 async fn main() {
-    let bootstrap_servers = std::env::args().nth(1).expect("no bootstraps servers given");
+    let bootstrap_servers = std::env::args()
+        .nth(1)
+        .expect("no bootstraps servers given");
     let flag_arg = std::env::args().nth(2);
     let flags = match flag_arg {
         Some(ref flags) => flags
@@ -45,6 +49,7 @@ async fn main() {
                 "create" => Flags::CREATE,
                 "produce" => Flags::PRODUCE,
                 "drop" => Flags::DROP,
+                "consume" => Flags::CONSUME,
                 &_ => Flags::NONE,
             })
             .reduce(|flags: Flags, flag| flags | flag)
@@ -56,72 +61,31 @@ async fn main() {
 
     let admin = Arc::new(create_admin(&bootstrap_servers));
 
-    let topics: Vec<String> = { 1..NUM_TOPICS + 1 }
-        .into_iter()
-        .map(|i| format!("test.rdkafka.{}", i))
-        .collect();
+    let topics = vec!["topic1".to_string()];
 
-    if flags.contains(Flags::CREATE) {
-        create_topics(admin.clone(), &topics).await;
+    create_topics(admin.clone(), &topics).await;
+
+    let mut produce_future = None; 
+
+    if flags.contains(Flags::PRODUCE) {
+        produce_future = Some(produce_messages(&topics, bootstrap_servers.as_str()));
     }
 
-    for _ in 0..999999999 {
-        let mut futures = vec![];
-        let (trigger, tripwire) = Tripwire::new();
+    let (trigger, tripwire) = Tripwire::new();
+    let mut consume_future = None;
 
-        let counter = Arc::new(AtomicUsize::new(topics.len() * 4));
-
-        if flags.contains(Flags::DROP) {
-            create_topics(admin.clone(), &topics).await;
-        }
-
-        if flags.contains(Flags::PRODUCE) {
-            produce_messages(&topics, bootstrap_servers.as_str()).await;
-        }
-
-        for topic in &topics {
-            futures.push(create_consumer_task(
-                bootstrap_servers.as_str(),
-                topic.as_str(),
-                tripwire.clone(),
-                counter.clone(),
-            ));
-            futures.push(create_consumer_task(
-                bootstrap_servers.as_str(),
-                topic.as_str(),
-                tripwire.clone(),
-                counter.clone(),
-            ));
-            futures.push(create_consumer_task(
-                bootstrap_servers.as_str(),
-                topic.as_str(),
-                tripwire.clone(),
-                counter.clone(),
-            ));
-            futures.push(create_consumer_task(
-                bootstrap_servers.as_str(),
-                topic.as_str(),
-                tripwire.clone(),
-                counter.clone(),
-            ));
-        }
-
-        // Give time for consumers to get messages
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        if flags.contains(Flags::DROP) {
-            drop_topics(admin.clone(), &topics).await;
-        }
-
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-
-        drop(trigger);
-
-        //println!("joining");
-        let len = futures.len();
-        let _ = join_all(futures).await;
-        println!("complete {} {}", chrono::offset::Local::now(), len);
+    if flags.contains(Flags::CONSUME) {
+        consume_future = Some(consume_messages(bootstrap_servers.as_str(), topics[0].as_str(), tripwire.clone()));
     }
+
+    if produce_future.is_some() && consume_future.is_some() {
+        futures::future::join(produce_future.unwrap(), consume_future.unwrap()).await;
+    } else if produce_future.is_some() {
+        produce_future.unwrap().await;
+    } else if consume_future.is_some() {
+        consume_future.unwrap().await;
+    }
+
 }
 
 #[derive(Debug, Snafu)]
@@ -146,6 +110,73 @@ impl ConsumerContext for KafkaStatisticsContext {
     }
 }
 
+async fn drop_loop(
+    bootstrap_servers: String,
+    flags: Flags,
+    admin: Arc<AdminClient<DefaultClientContext>>,
+) {
+    let topics: Vec<String> = { 1..NUM_TOPICS + 1 }
+        .into_iter()
+        .map(|i| format!("test.rdkafka.{}", i))
+        .collect();
+
+    if flags.contains(Flags::CREATE) {
+        create_topics(admin.clone(), &topics).await;
+    }
+
+    for _ in 0..999999999 {
+        let mut futures = vec![];
+        let (trigger, tripwire) = Tripwire::new();
+
+        if flags.contains(Flags::DROP) {
+            create_topics(admin.clone(), &topics).await;
+        }
+
+        if flags.contains(Flags::PRODUCE) {
+            produce_messages(&topics, bootstrap_servers.as_str()).await;
+        }
+
+        for topic in &topics {
+            futures.push(consume_messages(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+            ));
+            futures.push(consume_messages(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+            ));
+            futures.push(consume_messages(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+            ));
+            futures.push(consume_messages(
+                bootstrap_servers.as_str(),
+                topic.as_str(),
+                tripwire.clone(),
+            ));
+        }
+
+        // Give time for consumers to get messages
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        if flags.contains(Flags::DROP) {
+            drop_topics(admin.clone(), &topics).await;
+        }
+
+        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+
+        drop(trigger);
+
+        //println!("joining");
+        let len = futures.len();
+        let _ = join_all(futures).await;
+        println!("complete {} {}", chrono::offset::Local::now(), len);
+    }
+}
+
 async fn produce_messages(topics: &Vec<String>, bootstrap_servers: &str) {
     for topic in topics {
         let producer: &FutureProducer = &ClientConfig::new()
@@ -161,7 +192,7 @@ async fn produce_messages(topics: &Vec<String>, bootstrap_servers: &str) {
                 let delivery_status = producer
                     .send(
                         FutureRecord::to(topic)
-                            .payload(&format!("Message {} {{ 'hello': 'mezmo from vector' }}", i))
+                            .payload(&format!("Message {} {{ 'hello': 'mezmo from vector aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' }}", i))
                             .key(&format!("Key {}", i))
                             .headers(OwnedHeaders::new().insert(Header {
                                 key: "k1",
@@ -205,11 +236,10 @@ async fn drop_topics(admin: Arc<AdminClient<DefaultClientContext>>, topics: &Vec
     }
 }
 
-fn create_consumer_task(
+fn consume_messages(
     bootstrap_servers: &str,
     topic: &str,
     tripwire: Tripwire,
-    counter: Arc<AtomicUsize>,
 ) -> tokio::task::JoinHandle<()> {
     let topic = topic.to_string();
     let bootstrap_servers = bootstrap_servers.to_string();
@@ -229,9 +259,6 @@ fn create_consumer_task(
         loop {
             tokio::select! {
                 _ = tripwire.clone() => {
-                    println!("all done {} messages = {}, errors = {}, errors store offset = {}, count = {}",
-                        topic, msg_count, err_count, err_store_offset_count,
-                        counter.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) - 1);
                     break;
                 },
                 message = stream.next() => match message {
@@ -240,11 +267,11 @@ fn create_consumer_task(
                     Some(Ok(msg)) => {
                         msg_count += 1;
                         let _result = msg.payload();
-                        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+                        //tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
                         if let Err(_err)  = consumer.store_offset(msg.topic(), msg.partition(), msg.offset()) {
                             err_store_offset_count += 1;
                         }
-                        //println!("got message: {:?}", _msg);
+                        println!("got message {}: {:?}", msg_count, msg);
                     }
                 },
             }
@@ -264,7 +291,12 @@ fn create_consumer(
         .set("auto.offset.reset", "earliest")
         .set("session.timeout.ms", "6000")
         .set("socket.timeout.ms", "60000")
-        .set("fetch.wait.max.ms", "100")
+        .set("queued.min.messages", "1")
+        .set("queued.max.messages.kbytes", "16")
+        .set("message.max.bytes", "2097152")
+        .set("fetch.message.max.bytes", "10")
+        .set("fetch.error.backoff.ms", "1000")
+        .set("fetch.wait.max.ms", "1000")
         .set("enable.partition.eof", "false")
         .set("enable.auto.commit", "true")
         .set("auto.commit.interval.ms", "5000")
